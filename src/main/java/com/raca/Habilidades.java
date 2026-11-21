@@ -4,7 +4,6 @@ import java.util.HashMap;
 import java.util.Iterator;
 import java.util.List;
 import java.util.Map;
-import java.util.Optional;
 import java.util.UUID;
 
 import net.minecraft.entity.Entity;
@@ -15,9 +14,11 @@ import net.minecraft.entity.attribute.EntityAttributeModifier;
 import net.minecraft.entity.attribute.EntityAttributes;
 import net.minecraft.entity.damage.DamageSource;
 import net.minecraft.entity.damage.DamageTypes;
+import net.minecraft.entity.boss.WitherEntity;
 import net.minecraft.entity.decoration.ArmorStandEntity;
 import net.minecraft.entity.effect.StatusEffectInstance;
 import net.minecraft.entity.effect.StatusEffects;
+import net.minecraft.entity.mob.HostileEntity;
 import net.minecraft.entity.passive.TameableEntity;
 import net.minecraft.entity.passive.WolfEntity;
 import net.minecraft.particle.ParticleTypes;
@@ -29,6 +30,7 @@ import net.minecraft.sound.SoundEvents;
 import net.minecraft.text.Text;
 import net.minecraft.util.Identifier;
 import net.minecraft.util.math.Box;
+import net.minecraft.util.math.MathHelper;
 import net.minecraft.util.math.Vec3d;
 
 public class Habilidades {
@@ -40,13 +42,21 @@ public class Habilidades {
     static final float GRITO_DANO = 20.0f;        // 10 coracoes
     static final double GRITO_ALCANCE = 15.0;     // blocos
     static final int GRITO_RECARGA = 200;         // 10s
-    static final int LOBOS_QTD = 4;
+    static final int LOBOS_QTD = 30;
     static final int LOBOS_DURACAO = 600;         // 30s
     static final int LOBOS_RECARGA = 1200;        // 60s
     static final double LOBO_DANO = 8.0;
     static final double VIDA_EXTRA = 20.0;        // 10 coracoes
     static final int RESISTENCIA = 1;             // 1 = 40% menos dano
     static final float VOO_FOME = 0.03f;          // gasto de fome voando
+    static final float PISAO_MIN_QUEDA = 4.0f;    // blocos de queda para ativar o pisao
+    static final float PISAO_DANO_BLOCO = 1.5f;   // dano por bloco de queda
+    static final float PISAO_DANO_MAX = 30.0f;
+    static final double PISAO_RAIO = 6.0;
+    static final double AURA_RAIO = 12.0;         // mobs hostis fogem de voce
+    static final double AURA_VELOCIDADE = 1.3;    // velocidade da fuga
+    static final int REGEN_INTERVALO = 20;        // a cada 1s
+    static final float REGEN_CURA = 2.0f;         // 1 coracao por vez
     // ==========================================
 
     static final Identifier VIDA_ID = Identifier.of("raca", "vida_golem");
@@ -55,6 +65,7 @@ public class Habilidades {
     private static final Map<UUID, Integer> gritoLivre = new HashMap<>();
     private static final Map<UUID, Integer> lobosLivre = new HashMap<>();
     static final Map<UUID, Integer> LOBOS = new HashMap<>();
+    private static final Map<UUID, Float> ultimaQueda = new HashMap<>();
 
     public static boolean temRaca(ServerPlayerEntity p) {
         return p.getCommandTags().contains(TAG);
@@ -109,6 +120,11 @@ public class Habilidades {
             if (!temRaca(p)) continue;
             passivos(p, t);
             voo(p);
+            float ultima = ultimaQueda.getOrDefault(p.getUuid(), 0.0f);
+            if (p.isOnGround() && ultima >= PISAO_MIN_QUEDA) pisao(p, ultima);
+            ultimaQueda.put(p.getUuid(), p.fallDistance);
+            if (t % 2 == 0) aura(p);
+            if (t % REGEN_INTERVALO == 0 && p.getHealth() < p.getMaxHealth()) p.heal(REGEN_CURA);
             if (t % 10 == 0) status(p, t);
         }
         if (t % 10 == 0) expirarLobos(server, t);
@@ -214,24 +230,32 @@ public class Habilidades {
 
         // alvo mais proximo na linha da mira
         LivingEntity melhor = null;
-        double melhorDist = Double.MAX_VALUE;
+        double melhorT = Double.MAX_VALUE;
+        Vec3d seg = fim.subtract(inicio);
+        double len2 = seg.lengthSquared();
         List<LivingEntity> candidatos = w.getEntitiesByClass(LivingEntity.class,
-            new Box(inicio, fim).expand(1.5),
+            new Box(inicio, fim).expand(3.0),
             e -> e != p
                 && e.isAlive()
                 && !(e instanceof ArmorStandEntity)
                 && !(e instanceof TameableEntity tame && tame.isOwner(p)));
         for (LivingEntity e : candidatos) {
-            Optional<Vec3d> acerto = e.getBoundingBox().expand(0.4).raycast(inicio, fim);
-            if (acerto.isEmpty()) continue;
-            double d = inicio.squaredDistanceTo(acerto.get());
-            if (d < melhorDist) {
-                melhorDist = d;
+            Vec3d centro = e.getBoundingBox().getCenter();
+            double tt = MathHelper.clamp(
+                centro.subtract(inicio).dotProduct(seg) / len2, 0.0, 1.0);
+            Vec3d ponto = inicio.add(seg.multiply(tt));
+            double tol = Math.max(e.getWidth(), e.getHeight()) / 2.0 + 0.8;
+            if (centro.distanceTo(ponto) > tol) continue;
+            if (tt < melhorT) {
+                melhorT = tt;
                 melhor = e;
             }
         }
 
+        int passos = (int) GRITO_ALCANCE;
         if (melhor != null) {
+            passos = (int) (GRITO_ALCANCE * melhorT) + 7;
+            melhor.timeUntilRegen = 0;
             melhor.damage(w.getDamageSources().sonicBoom(p), GRITO_DANO);
             double res = 1.0 - melhor.getAttributeValue(EntityAttributes.GENERIC_KNOCKBACK_RESISTANCE);
             melhor.addVelocity(dir.x * 2.5 * res, dir.y * 0.5 * res, dir.z * 2.5 * res);
@@ -240,11 +264,52 @@ public class Habilidades {
 
         w.playSound(null, p.getX(), p.getY(), p.getZ(),
             SoundEvents.ENTITY_WARDEN_SONIC_BOOM, SoundCategory.PLAYERS, 3.0f, 1.0f);
-        for (int i = 1; i <= (int) GRITO_ALCANCE; i++) {
+        for (int i = 1; i <= passos; i++) {
             w.spawnParticles(ParticleTypes.SONIC_BOOM,
                 inicio.x + dir.x * i, inicio.y - 0.3 + dir.y * i, inicio.z + dir.z * i,
                 1, 0, 0, 0, 0);
         }
+    }
+
+    // ---------- Aura de medo: mobs hostis fogem ----------
+    private static void aura(ServerPlayerEntity p) {
+        ServerWorld w = p.getServerWorld();
+        List<HostileEntity> mobs = w.getEntitiesByClass(HostileEntity.class,
+            p.getBoundingBox().expand(AURA_RAIO),
+            m -> m.isAlive()
+                && !(m instanceof WitherEntity)
+                && m.squaredDistanceTo(p) <= AURA_RAIO * AURA_RAIO);
+        for (HostileEntity m : mobs) {
+            if (m.getTarget() == p) m.setTarget(null);
+            Vec3d fora = m.getPos().subtract(p.getPos());
+            if (fora.lengthSquared() < 0.01) continue;
+            Vec3d destino = m.getPos().add(fora.normalize().multiply(10.0));
+            m.getNavigation().startMovingTo(destino.x, destino.y, destino.z, AURA_VELOCIDADE);
+        }
+    }
+
+    // ---------- Golem/Dragao: pisao ao cair ----------
+    private static void pisao(ServerPlayerEntity p, float queda) {
+        ServerWorld w = p.getServerWorld();
+        float dano = Math.min(queda * PISAO_DANO_BLOCO, PISAO_DANO_MAX);
+        List<LivingEntity> alvos = w.getEntitiesByClass(LivingEntity.class,
+            p.getBoundingBox().expand(PISAO_RAIO),
+            e -> e != p
+                && e.isAlive()
+                && !(e instanceof ArmorStandEntity)
+                && !(e instanceof TameableEntity tame && tame.isOwner(p))
+                && e.squaredDistanceTo(p) <= PISAO_RAIO * PISAO_RAIO);
+        for (LivingEntity e : alvos) {
+            e.damage(w.getDamageSources().playerAttack(p), dano);
+            e.takeKnockback(1.2, p.getX() - e.getX(), p.getZ() - e.getZ());
+            e.addVelocity(0, 0.5, 0);
+            e.velocityModified = true;
+        }
+        w.playSound(null, p.getX(), p.getY(), p.getZ(),
+            SoundEvents.ENTITY_WARDEN_ATTACK_IMPACT, SoundCategory.PLAYERS, 2.0f, 0.8f);
+        w.spawnParticles(ParticleTypes.EXPLOSION,
+            p.getX(), p.getY() + 0.1, p.getZ(), 8, 2.5, 0.1, 2.5, 0);
+        aviso(p, "Pisao! " + (int) dano + " de dano");
     }
 
     // ---------- Player: lobos ----------
@@ -261,9 +326,10 @@ public class Habilidades {
         for (int i = 0; i < LOBOS_QTD; i++) {
             WolfEntity lobo = EntityType.WOLF.create(w);
             if (lobo == null) continue;
-            double ang = Math.PI * 2 * i / LOBOS_QTD;
+            double ang = i * 2.4;
+            double raio = 2.0 + Math.sqrt(i) * 0.8;
             lobo.refreshPositionAndAngles(
-                p.getX() + Math.cos(ang) * 2, p.getY(), p.getZ() + Math.sin(ang) * 2,
+                p.getX() + Math.cos(ang) * raio, p.getY(), p.getZ() + Math.sin(ang) * raio,
                 p.getYaw(), 0);
             lobo.setOwner(p);
             lobo.addCommandTag(TAG_LOBO);
@@ -306,4 +372,4 @@ public class Habilidades {
             it.remove();
         }
     }
-}
+                               }
